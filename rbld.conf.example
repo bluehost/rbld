@@ -1,0 +1,21 @@
+# Path to rbld log file
+log: /var/log/rbld.log
+
+# Path to executable
+run_path: /usr/sbin/rbld
+
+# Path to main configuration file
+conf: /etc/rbld.conf
+
+# Path to list configuration file
+listconf: /etc/rbld.d/lists.conf
+
+# Path to infile (for use with inwatch)
+infile: /etc/inrbld
+
+# Path to rbld socket
+sock_path: /var/run/rbld.sock
+
+# Owner and Group that socket will be chown'd to
+sock_owner: root
+sock_group: root

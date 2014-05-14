@@ -1,0 +1,6 @@
+# Configuration file for the rbld service.
+
+#
+# To pass additional options to rbld at startup, set OPTIONS here.
+#
+OPTIONS=''

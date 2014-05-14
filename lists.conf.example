@@ -1,0 +1,17 @@
+# List configuration file for rbld
+#
+# Whitelists are global, blacklists can be queried directly.
+#
+# NAME  TYPE [whitelist|blacklist]  FILE  FILE_FORMAT[IP|CIDR|TRIE|META]:[EXPIRE|TRIE_SPLIT|LIST]  [STAT_ONLY]
+#
+# Example single list:
+GLOBALWL whitelist /etc/rbld.d/lists/rbl_whitelist CIDR
+MALWARE blacklist /etc/rbld.d/lists/rbl_mal IP
+EXIM blacklist /etc/rbld.d/lists/rbl_exim IP
+#
+# Example meta list:
+EMAIL blacklist EMAIL META:MALWARE,EXIM
+#
+# Example files with expirations:
+LOCALWL whitelist /etc/rbld.d/lists/rbl_local_whitelist IP:1
+LOCALBL blacklist /etc/rbld.d/lists/rbl_local_blacklist IP:1

@@ -1,0 +1,32 @@
+# Path to directory where lists will be saved
+list_path: /etc/rbld.d/lists
+# Obsolete option
+# This will be removed in future releases
+home_dir: /root
+# Pid file to check so that we aren't running twice
+pid: /var/run/pullrbllists
+
+# The following is a sample set of list configurations
+# The type simply allows you to specify which types you
+# want downloaded using the pullrbllists script.
+# The username/password options are there in case you use
+# authentication to access your lists.  Currently only
+# Basic Authentication is supported.
+# The url is the location of the list
+# The local_file option is what you would like the file
+# to be named once it is downloaded in the following form:
+# list_path/local_file (/etc/rbld.d/lists/rbl_bruteforce)
+#
+# The second example doesn't use Basic Authentication, so
+# don't include a username or password
+lists:
+  bruteforce:
+    type: ipv4
+    username: exampleuser
+    password: exampleuserpassword
+    url: http://rbldlists.yourdomain.com/rbld.bruteforce.list
+    local_file: rbl_bruteforce
+  ablacklist:
+    type: packed
+    url: http://rbldlists.yourdomain.com/packed_blacklist
+    local_file: packed_blacklist

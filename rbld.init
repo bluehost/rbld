@@ -1,0 +1,98 @@
+#!/bin/bash
+#
+# rbld         Startup script for the RBLD server
+#
+# Author: Erick Cantwell <ecantwell@bluehost.com>
+#
+# chkconfig:   345 85 15
+# description: RBLD is the daemon holding blacklists \
+#              and whitelists of IP addresses
+# processname: rbld
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+if [ -f /etc/sysconfig/rbld ]; then
+    . /etc/sysconfig/rbld
+fi
+
+prog=rbld
+rbld='/usr/sbin/rbld'
+pidfile=/var/run/rbld.pid
+lockfile=/var/lock/subsys/rbld
+RETVAL=0
+
+start() {
+    echo -n $"Starting $prog: "
+    daemon $rbld $OPTIONS
+    RETVAL=$?
+    echo
+    [ $RETVAL = 0 ] && touch ${lockfile}
+    return $RETVAL
+}
+stop() {
+    echo -n $"Stopping $prog: "
+    kill `cat $pidfile` 2>/dev/null
+    RETVAL=$?
+    if [ $RETVAL = 0 ]; then
+      rm -f ${lockfile}
+      success
+    else
+      failure
+    fi
+    echo
+    return $RETVAL
+}                                                                                                                                                                                                    
+reload() {
+    echo -n $"Reloading $prog: "
+    kill -HUP `cat $pidfile` 2>/dev/null
+    RETVAL=$?
+    if [ $RETVAL = 0 ]; then
+      success
+    else
+      failure
+    fi
+    echo
+    return $RETVAL
+}
+status() {
+    if [ ! -f "/var/run/rbld.pid" ]; then
+        failure
+        exit 1
+    fi
+    MYPID=`/bin/cat /var/run/rbld.pid | /usr/bin/tr -d '\n'`
+    /bin/grep -q 'rbld' /proc/$MYPID/cmdline
+    if [ $? == '0' ]; then
+        success
+        exit 0
+    else
+        failure
+        exit 1
+    fi
+}
+
+# See how we were called.
+case "$1" in
+  start)
+    start
+    ;;
+  stop)
+    stop
+    ;;
+  restart)
+    stop
+    sleep 1
+    start
+    ;;
+  reload)
+    reload
+    ;;
+  status)
+    status
+    ;;
+  *)
+    echo $"Usage: $prog {start|stop|restart|reload|status}"
+    exit 1
+esac
+
+exit $RETVAL
