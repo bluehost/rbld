@@ -1,0 +1,688 @@
+#!/usr/bin/perl
+
+##########################################################################
+# rbld - Daemon that reads and serves IP based blacklists and whitelists
+# Copyright 2006, Bluehost, Inc.
+#
+# Authors and Contributers:
+#
+# Spencer Candland  <spencer@bluehost.com>
+# Ryan Chaudhry     <rchaudhry@bluehost.com>
+# Erick Cantwell    <erick@bluehost.com>
+#
+# http://www.bluehost.com
+# https://github.com/bluehost/rbld
+#
+##########################################################################
+#
+# This file is part of rbld
+#
+# Rbld free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA02111-1307, USA.
+#
+##########################################################################
+
+use strict;
+use warnings;
+
+use IO::File;
+use IO::Socket;
+use Fcntl qw(F_SETFD);
+use Proc::Daemon;
+use Proc::PID::File;
+use Data::Dumper;
+use Getopt::Long;
+use YAML::Syck qw(LoadFile);
+use Time::HiRes qw(gettimeofday tv_interval);
+use POSIX;
+
+my $config   = {};
+my $settings = {};
+
+my $defaults = {
+    rbld_conf  => '/etc/rbld.conf',
+    log        => '/var/log/rbld.log',
+    infile     => '/etc/inrbld',
+    listconf   => '/etc/rbld.d/rbldlists.conf',
+    run_path   => '/usr/sbin/rbld',
+    sock_path  => '/var/tmp/rbld.sock',
+    sock_owner => 'mailnull',
+    sock_group => 'nobody',
+    debug      => 0,
+};
+
+# Get cli options
+GetOptions (
+    'c|config=s'      => \$config->{rbld_conf},
+    'o|log=s'         => \$config->{log},
+    'i|infile=s'      => \$config->{infile},
+    'l|listconf=s'    => \$config->{listconf},
+    'r|runpath=s'     => \$config->{run_path},
+    's|socketpath=s'  => \$config->{sock_path},
+    'u|socketowner=s' => \$config->{sock_owner},
+    'g|socketgroup=s' => \$config->{sock_group},
+    'd|debug'         => \$config->{debug},
+    'h|help'          => \&help,
+) || &help;
+
+# Start
+my @start = gettimeofday();
+my $DEBUG = 0;
+my ($dfh, $in_pid);
+my %lists;
+my %all;
+my %info = (
+  blacklist         => {},
+  infile	    => {},
+  metastats	    => {},
+  starttime         => time(),
+  stats		    => {},
+  whitelist         => {},
+);
+
+my %run = (
+  DEBUG                   => sub { $DEBUG = shift; return; },
+  DUMP                    => sub { return Dumper (%info, %lists); },
+  LOAD_CONF		  => \&load_conf,
+  LOAD_LIST		  => \&load_list,
+  CIDR			  => \&check_cidr,
+  IP			  => \&check_ip,
+  TRIE			  => \&check_trie,
+  META			  => \&check_meta,
+  ALL			  => \&check_all,
+  WHITELIST		  => \&check_whitelist, 
+  STAT			  => \&give_stats,
+  STATS			  => \&give_stats,
+);
+
+my %load = (
+  CIDR			  => \&load_cidr,
+  IP			  => \&load_ip,
+  TRIE			  => \&load_trie,
+  META			  => \&load_meta,
+);
+
+sub debug {
+  return unless $DEBUG;
+  warn scalar(localtime).": [$$] @_";
+}
+
+sub main {
+  # Load default or cli specified configuration file
+  if ($config->{rbld_conf}) {
+      $settings = LoadFile($config->{rbld_conf});
+  } else {
+      $settings = LoadFile($defaults->{rbld_conf});
+  }
+
+  # Merge to config hash
+  # These/this should be moved to a subroutine
+  my @vals = ('log', 'infile', 'listconf', 'run_path', 'sock_path', 'sock_owner', 'sock_group', 'debug');
+
+  # First, merge conf file to cli
+  foreach (@vals) {
+      my $val = $_;
+      unless ($config->{$val}) {
+          if ($settings->{$val}) {
+              $config->{$val} = $settings->{$val};
+          }
+      }
+  }
+
+  # Next merge defaults into the config
+  foreach (@vals) {
+      my $val = $_;
+      unless ($config->{$val}) {
+          if ($defaults->{$val}) {
+              $config->{$val} = $defaults->{$val};
+          }
+      }
+  }
+
+  $DEBUG = 1 if $config->{debug};
+  $0 = "rbld";
+
+  Proc::Daemon::Init() unless $ENV{BIND_FD};
+  umask 0117;
+  exit 1 if Proc::PID::File->running();
+
+  open_log();
+
+  $SIG{TERM} = $SIG{INT} = sub { exit 0 };
+  $SIG{PIPE} = sub { die "PIPE" };
+  my $sigset = POSIX::SigSet->new();
+  POSIX::sigaction(&POSIX::SIGUSR2, POSIX::SigAction->new('open_log',
+     $sigset, &POSIX::SA_NODEFER));
+  POSIX::sigaction(&POSIX::SIGHUP, POSIX::SigAction->new('reload',
+     $sigset, &POSIX::SA_NODEFER));
+
+  reset_infile();
+  my @rblstart = gettimeofday();
+  warn scalar(localtime).": [$$] Loading Conf and Lists...\n";
+  load_conf($config->{listconf});
+  &link_meta;
+  warn scalar(localtime).": [$$] load completed in (".tv_interval (\@rblstart).").\n";
+
+  my $listen;
+  if (exists $ENV{BIND_FD} and $ENV{BIND_FD} =~ /^(\d+)$/) {
+    my $bind_fd = $1;
+    debug "Reusing fd($bind_fd)\n";
+    $listen = IO::Socket::UNIX->new();
+    $listen->fdopen($bind_fd, "r") or die "Socket: $!";
+  }
+  else {
+    unlink $config->{sock_path};
+    $listen = IO::Socket::UNIX->new(
+      Local  => $config->{sock_path},
+      Listen => SOMAXCONN,
+    ) or die "Socket: $!";
+
+    chown ( ((getpwnam("$config->{sock_owner}"))[2]), ((getgrnam("$config->{sock_group}"))[2]),  $config->{sock_path}) || warn "Could not chown socket: $!";
+  }
+
+  warn scalar(localtime).": [$$] $0 startup completed in (".tv_interval (\@start).").  Now Listening.\n";
+  my ($conn, $req, $bvec, $rw, $timeleft, $nfound, $buffer, $data, $msg);
+  while (1) {
+    eval {
+      $conn = $listen->accept() or die "Accept error: $!\n";
+      $req = $bvec = '';
+      vec($bvec, $conn->fileno, 1) = 1;
+      $timeleft = 0.2;
+      while ($timeleft > 0) {
+        ($nfound, $timeleft) = select($rw=$bvec, undef, undef, $timeleft);
+        $buffer = '';
+        if ($nfound != 0) {
+          sysread($conn, $buffer, 8192) or die "EOF on connection\n";
+        }
+        $req .= $buffer;
+        last if index($buffer, "\n") > 0;
+      }
+      die "Timed out on request\n" if $timeleft == 0;
+      $req =~ s/\n.*//;
+    };
+    if ($@) {
+      debug $@;
+      $conn->shutdown(2) if $conn;
+      next;
+    }
+
+    $info{requests}++;
+
+    my ($cmd, $args) = split (/\s+/, $req, 2);
+    $msg = '';
+    if ($run{$cmd}) {
+      debug "Running command [$req]\n";
+      $msg = &{$run{$cmd}}($args);
+    } else {
+      debug "Unknown command [$req]\n";
+    }
+
+
+    eval {
+      $timeleft = 0.5;
+      $buffer = 0;
+      if ($msg) {
+        do {
+          ($nfound, $timeleft) = select(undef, $rw=$bvec, undef, $timeleft);
+          if ($nfound != 0) {
+            $buffer += syswrite($conn, $msg, length($msg));
+          }
+        } until ($timeleft == 0 or $buffer == length($msg));
+      }
+      $conn->shutdown(2);
+    };
+  }
+}
+
+# NAME  TYPE [whitelist|blacklist]  FILE  FILE_FORMAT[IP|CIDR|TRIE|META]:[EXPIRE|TRIE_SPLIT|LIST]  [STAT_ONLY]
+sub load_conf {
+
+  my $cfile = shift;
+  debug "Loading config file $cfile\n";
+  my %nlists;
+  if (-e $cfile) {
+    # read the config
+    open (CF, "<$cfile");
+    flock (CF, 2);
+    while (<CF>) {
+      chomp($_);
+      next unless ($_);
+      next if (substr($_, 0, 1) eq "#");
+      my @tmp = split (/\s+/, $_);
+      my $file = $tmp[2];
+      # Make sure we have a valid type
+      my $type = $tmp[1];
+      next unless (($type eq "whitelist") or ($type eq "blacklist"));
+      # Make sure we have a valid format
+      my @split = split (/:/, $tmp[3]);
+      my $format = $split[0];
+      next unless (exists ($load{$format}));
+
+      $nlists{$file}{"file"} = $file;
+      $nlists{$file}{"name"} = $tmp[0];
+      $nlists{$file}{"type"} = $type;
+      $nlists{$file}{"format"} = $format;
+      $nlists{$file}{"split"} = $split[1] || 0;
+      $nlists{$file}{"stat_only"} = $tmp[4] || 0;
+      $nlists{$file}{"cfile"} = $cfile;
+      # So we can get at data through name as well, which
+      # is how queries to the list actually come through
+      $nlists{$tmp[0]} = \%{$nlists{$file}};
+    }
+    flock (CF, 8);
+    close (CF);
+
+    foreach my $file (keys %nlists) {
+      # See if conf changed    
+      if (exists $lists{$file}) {
+        my $diff = 0;
+        foreach (keys %{$nlists{$file}}) {
+          $diff = 1 if ($nlists{$file}{$_} ne $lists{$file}{$_});
+        }
+        next unless ($diff == 1);
+      }
+
+      my $name = $nlists{$file}{"name"};
+      $lists{$file} = $nlists{$file};
+      load_list ($file);
+      # Create our inwatch watches
+      my $realfile = $lists{$file}{"file"};
+      add_to_infile ($realfile, "LOAD_LIST") unless (exists $nlists{$name}{"meta"});
+      # Create a run command for the list
+      $run{$name} = sub { return check_list($name, shift); },
+    }
+
+    # Find and delete options that were removed
+    foreach my $file (keys %lists) {
+      next unless ($lists{$file}{"cfile"} eq $cfile);
+      unless (exists $nlists{$file}) {
+        debug "$file was removed from conf $cfile, removing\n";
+        my $type = $lists{$file}{"type"};
+        my $name = $lists{$file}{"name"};
+        delete ($info{$type}{$name});
+        delete ($info{"stats"}{$name});
+        delete ($lists{$file});
+        delete ($run{$name});
+      }
+    }
+  }
+  # Even if it doesn't exist we want to add it, that way
+  # we can create it and then watch it.  Mainly useful
+  # for things like our local whitelists, which may not
+  # exist yet on new servers
+  add_to_infile ($cfile, "LOAD_CONF");
+}
+
+# Take any list, and call correct routine based on format
+sub load_list {
+  my $file = shift;
+  debug "Caught load_list on $file\n";
+  my $format = $lists{$file}{"format"};
+  if ($load{$format}) {
+    my $name = $lists{$file}{"name"};
+    warn scalar(localtime).": [$$] Loading $name $file (".$lists{$file}{"type"}." $format)\n";
+    return &{$load{$format}}($file);
+  }
+}
+
+sub load_cidr {
+  my $file = shift;
+  if (-e $file) {
+    open (LST, "<$file");
+    flock (LST, 2);
+    my $type = $lists{$file}{"type"};
+    my $name = $lists{$file}{"name"};
+    my $split = $lists{$file}{"split"};
+    my $expire = 0;
+    delete ($info{$type}{$name});
+    while (<LST>) {
+      chomp($_);
+      next unless ($_);
+      next if (substr($_, 0, 1) eq "#");
+      my $line = $_;
+      if ($split) {
+        my @tmp = split (/\s+/, $_);
+        if (time >= $tmp[0]) {
+          $expire = 1;
+          next;
+        }
+        $line = $tmp[1];
+      }
+      my ($ip, $mask) = split (/\//, $line);
+      if ($mask < 8) {
+        warn scalar(localtime).": [$$] CIDR range is too large ($ip/$mask), skipping.\n";
+        next;
+      }
+      # Handle ranges bigger then 16
+      my $range = 0;
+      if ($mask < 16) {
+        $range = ((2 ** (16 - $mask)) - 1);
+      }
+      foreach (0 .. $range) {
+        my $adjm = (32 - $mask);
+        my @oct = split (/\./, $ip);
+        $oct[1] += $_;
+
+        # Make sure we have some minimum and maximum values
+        $info{$type}{$name}{$oct[0]}{$oct[1]}{min} = $adjm unless (exists $info{$type}{$name}{$oct[0]}{$oct[1]}{min});
+        $info{$type}{$name}{$oct[0]}{$oct[1]}{max} = $adjm unless (exists $info{$type}{$name}{$oct[0]}{$oct[1]}{max});
+
+        $info{$type}{$name}{$oct[0]}{$oct[1]}{min} = $adjm if ($adjm < $info{$type}{$name}{$oct[0]}{$oct[1]}{min});
+        $info{$type}{$name}{$oct[0]}{$oct[1]}{max} = $adjm if ($adjm > $info{$type}{$name}{$oct[0]}{$oct[1]}{max});
+
+        my $pack = unpack("N", pack("C4", @oct)) >> $adjm;
+        $info{$type}{$name}{$oct[0]}{$oct[1]}{$adjm}{$pack} = 1;
+      }
+    }
+    if ($expire == 1) {
+      seek (LST, 0, 0);
+      foreach (keys %{$info{$type}{$name}}) {
+        print LST "$info{$type}{$name}{$_} $_\n";
+      }
+      truncate LBT, tell(LBT);
+    }
+    flock (LST, 8);
+    close (LST);
+    $all{$name} = 1;
+  }
+}
+
+sub load_ip {
+  my $file = shift;
+  if (-e $file) {
+    open (LST, "+<$file");
+    flock (LST, 2);
+    my $type = $lists{$file}{"type"};
+    my $name = $lists{$file}{"name"};
+    my $split = $lists{$file}{"split"};
+    my $expire = 0;
+    delete ($info{$type}{$name});
+    while (<LST>) {
+      chomp($_);
+      next unless ($_);
+      next if (substr($_, 0, 1) eq "#");
+      if ($split) {
+        my @tmp = split (/\s+/, $_);
+        if (time >= $tmp[0]) {
+          $expire = 1;
+          next;
+        }
+        $info{$type}{$name}{$tmp[1]} = $tmp[0];
+      } else {
+        $info{$type}{$name}{$_} = 1;
+      }
+    }
+    if ($expire == 1) {
+      seek (LST, 0, 0);
+      foreach (keys %{$info{$type}{$name}}) {
+        print LST "$info{$type}{$name}{$_} $_\n";
+      }
+      truncate LBT, tell(LBT);
+    }
+    flock (LST, 8);
+    close (LST);
+    $all{$name} = 1;
+  }
+}
+
+sub load_meta {
+  my $file = shift;
+  @{$lists{$file}{"meta"}} = split (/,/, $lists{$file}{"split"});
+}
+
+sub load_trie {
+  my $file = shift;
+  if (-e $file) {
+    open (LST, "<$file");
+    flock (LST, 2);
+    my $type = $lists{$file}{"type"};
+    my $name = $lists{$file}{"name"};
+    delete ($info{$type}{$name});
+    while (<LST>) {
+      chomp($_);
+      next unless ($_);
+      next if (substr($_, 0, 1) eq "#");
+      my ($key, $value) = split (/\s+/);
+      $info{$type}{$name}{$key} = $value;
+    }
+    flock (LST, 8);
+    close (LST);
+    $all{$name} = 1;
+  }
+}
+
+# Make fake meta_list masquarade as a real list, primarily for stats
+sub link_meta {
+  foreach (keys %lists) {
+    if ($lists{$_}{"format"} eq "META") {
+      my $meta_name = $lists{$_}{"name"};
+      foreach my $list_name (@{$lists{$meta_name}{"meta"}}) {
+        $lists{$meta_name."_".$list_name} = \%{$lists{$list_name}};
+      }
+    }
+  }
+}
+
+# Whitelists are global, so checks all whitelists.
+sub check_whitelist {
+  my $ip = shift;
+  foreach my $name (keys %{$info{whitelist}}) {
+    $info{"stats"}{$name}{"requests"}++;
+    my $format = $lists{$name}{"format"};
+    if (&{$run{$format}}($name, $ip)) {
+      $info{"stats"}{$name}{"rejections"}++;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+# Check any list, will call correct routine based on format
+sub check_list {
+  my $name = shift;
+  my $ip = shift;
+  my $format = $lists{$name}{"format"};
+
+  # Increment requests
+  $info{"stats"}{$name}{"requests"}++;
+
+  my $ret = &{$run{$format}}($name, $ip);
+  if ($ret) {
+    my $type = $lists{$name}{"type"};
+    # If type is not a blacklist we don't need to check whitelist
+    if ($type ne "blacklist") {
+      $info{"stats"}{$name}{"rejections"}++;
+      # Don't block if we are setup as stats only
+      return 0 if ($lists{$name}{"stat_only"});
+      return 1;
+    }
+
+    # If we were on a blacklist, check the whitelist.
+    # We do it in this order to get good whitelist stats.
+    return 0 if (check_whitelist($ip));
+    $info{"stats"}{$name}{"rejections"}++;
+    if ($ret ne 1) {
+      $info{"stats"}{$ret}{"rejections"}++ if ($ret ne 1);
+      return 0 if ($lists{$ret}{"stat_only"});
+    }
+    # Don't block if we are setup as stats only
+    return 0 if ($lists{$name}{"stat_only"});
+    return 1;
+  }
+  return 0
+}
+
+sub check_all {
+  # TODO, gather stats, requests and rejections, on
+  # the exact lists inside the "all" list.
+  # TODO, make it so you can specify a "all" list
+  # in the conf
+  my $ip = shift;
+  my $hits = "";
+  foreach my $list_name (keys %all) {
+    my $format = $lists{$list_name}{"format"};
+    $hits .= "$list_name " if (&{$run{$format}}($list_name, $ip));
+  }
+  return 0 if (check_whitelist($ip));
+  return $hits;
+}
+
+sub check_cidr {
+  my $name = shift;
+  my $ip = shift;
+  my $type = $lists{$name}{"type"};
+
+  my @oct = split (/\./, $ip);
+  return 0 unless (exists $info{$type}{$name}{$oct[0]});
+  return 0 unless (exists $info{$type}{$name}{$oct[0]}{$oct[1]});
+  # bitshift from my min mask to max to do the check
+  foreach ($info{$type}{$name}{$oct[0]}{$oct[1]}{min} .. $info{$type}{$name}{$oct[0]}{$oct[1]}{max}) {
+    my $pack = unpack("N", pack("C4", @oct)) >> $_;
+    return 1 if ($info{$type}{$name}{$oct[0]}{$oct[1]}{$_}{$pack});
+  }
+  return 0;
+}
+
+sub check_ip {
+  my $name = shift;
+  my $ip = shift;
+  my $type = $lists{$name}{"type"};
+  return 1 if ($info{$type}{$name}{$ip});
+  return 0;
+}
+
+sub check_meta {
+  my $name = shift;
+  my $ip = shift;
+  foreach my $list_name (@{$lists{$name}{"meta"}}) {
+    # Make sure list actually exists
+    next unless (exists $lists{$list_name});
+    my $format = $lists{$list_name}{"format"};
+    $info{"stats"}{$name."_".$list_name}{"requests"}++;
+    return $name."_".$list_name if (&{$run{$format}}($list_name, $ip));
+  }
+  return 0;
+}
+
+sub check_trie {
+  my $name = shift;
+  my $ip = shift;
+  my $type = $lists{$name}{"type"};
+  my $split = $lists{$name}{"split"};
+
+  my @oct = split (/\./, $ip);
+  my $data = unpack("N", pack("C4", @oct));
+  my $key = substr $data, 0, $split;
+  my $value = substr $data, $split;
+
+  return 0 unless (exists $info{$type}{$name}{$key});
+  return 1 if (1+index( $info{$type}{$name}{$key}, ":$value:" ));
+  return 0;
+}
+
+sub give_stats {
+  my $running = time - $info{"starttime"};
+  return unless ($running);
+  my (@time) = gmtime($running);
+  my $stats .= sprintf ("\n%30s:\t%d Days %d Hours %d Min %d Sec\n",
+    "Uptime", $time[7], $time[2], $time[1], $time[0], $running);
+  $stats .= sprintf ("%30s:\t%d\n", "Total Requests", $info{"requests"});
+  $stats .= sprintf ("%30s:\t%.2f\n", "Requests Per Second", ($info{"requests"} / $running));
+  foreach my $name (sort keys %{$info{"stats"}}) {
+    my $wording = "Rejections";
+    $stats .= sprintf ("\n%30s:\t%d (%.2f%%)", "$name Requests",
+      $info{"stats"}{$name}{"requests"},
+      (($info{"stats"}{$name}{"requests"} / $info{"requests"})*100));
+    # It is kind of awkward to call a whitelist save a "rejection"
+    # so we update the wording as appropriate
+    $wording = "Saves" if ($lists{$name}{"type"} eq "whitelist");
+    # Avoid uninitialized errors
+    if (exists $info{"stats"}{$name}{"rejections"}) {
+      $stats .= sprintf ("\n%30s:\t%d (%.2f%%)\n", "$name $wording",
+        $info{"stats"}{$name}{"rejections"},
+        (($info{"stats"}{$name}{"rejections"} / $info{"stats"}{$name}{"requests"}) * 100));
+    } else {
+      $stats .= sprintf ("\n%30s:\t%d\n", "$name $wording", 0);
+    }
+    $stats .= sprintf ("%30s:\t%.2f\n", "$name RPS", ($info{"stats"}{$name}{"requests"} / $running));
+  }
+  return $stats;
+}
+
+# Add a watch on a file via inwatch
+sub add_to_infile {
+  my $file = shift;
+  return if ($info{"infile"}{$file});
+  my $cmd = shift;
+  open (INF, ">>$config->{infile}");
+  print INF "$file IN_MODIFY|IN_CREATE_SELF SOCK RBLD $cmd $file\n";
+  close (INF);
+  $info{"infile"}{$file} = 1;
+  return;
+}
+
+sub reset_infile {
+  delete $info{"infile"};
+  open (INF, ">$config->{infile}");
+  close (INF);
+}
+
+sub open_log {
+  warn scalar(localtime).": [$$] $0 Reseting log file...\n";
+  close (STDERR);
+  open STDERR, ">>$config->{log}";
+  chmod 0600, $config->{log};
+  warn scalar(localtime).": [$$] $0 Log file open.\n";
+  # TODO, Make this reload on the next request after
+  # something expires instead of once a day.
+  # Reload lists with entries that expire.
+  foreach my $file (keys %lists) {
+    next unless ($lists{$file}{"split"});
+    next if ($lists{$file}{"format"} eq "TRIE");
+    load_list ($file);
+  }
+}
+
+sub reload {
+  warn scalar(localtime).": [$$] $0 reloading...\n";
+  exit if fork;
+  sleep 2;
+  exec "$config->{run_path}" or die "exec: $!";
+}
+
+# HELP ME!!!
+sub help {
+    print <<EOF;
+        -c|--config      Path to rbld daemon configuration file
+        -o|--log=s       Path to rbld log
+        -i|--infile      Path to rbld infile
+        -l|--listconf    Path to rbld list configuration file
+        -r|--runpath     Path to run path of script (/usr/sbin/rbld)
+        -s|--socketpath  Path to rbld socket
+        -u|--socketowner Who the rbld socket owner will be set to
+        -g|--socketgroup Which group the rbld socket will be set to
+        -d|--debug       Debug output
+        -h|--help        This lovely help message
+EOF
+    exit 0;
+}
+
+END {
+  debug "Exiting...\n";
+  $dfh->close if defined $dfh;
+  exit 0;
+}
+
+
+main();
