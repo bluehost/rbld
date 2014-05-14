@@ -1,0 +1,102 @@
+#!/usr/bin/perl
+
+##########################################################################
+# rbldstats - A script to query rbld and print out statistics
+# Copyright 2006, Bluehost, Inc.
+#
+# Authors and Contributers:
+#
+# Spencer Candland  <spencer@bluehost.com>
+# Erick Cantwell    <erick@bluehost.com>
+#
+# http://www.bluehost.com
+# https://github.com/bluehost/rbld
+#
+##########################################################################
+#
+# This file is part of rbld
+#
+# Rbld free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA02111-1307, USA.
+#
+##########################################################################
+
+use strict;
+use warnings;
+
+use IO::Socket;
+use IO::Select;
+use Data::Dumper;
+use YAML::Syck qw(LoadFile);;
+use Getopt::Long;
+
+my $config_file = '/etc/rbld.conf';
+my $socket_path;
+my $settings;
+
+# Get cli options
+GetOptions (
+    'c|config=s'    => \$config_file,
+    's|socket=s'    => \$socket_path,
+    'h|help'        => \&help,
+) || &help;
+
+$Data::Dumper::Indent = 1;
+$Data::Dumper::Useqq = 1;
+
+sub main {
+    if ($socket_path) {
+        $settings->{sock_path} = $socket_path;
+    } else {
+        $settings = LoadFile($config_file);
+    }
+
+    unless ($settings->{sock_path}) {
+        print STDERR "No socket path available to query.  Aborting...\n";
+        exit 1;
+    }
+
+    my ($msg, $data, $buffer, $sock);
+    $msg = "STATS\n";
+
+    $sock = IO::Socket::UNIX->new($settings->{sock_path}) or die "Socket: $!\n";
+
+    eval {
+      syswrite($sock, $msg, length($msg));
+
+      $data = '';
+      $data .= $buffer while sysread($sock, $buffer, 8192);
+
+      $sock->shutdown(2);
+    };
+    if ($@) {
+      print $@;
+    }
+    print "RECV> $data\n";
+}
+
+main();
+
+sub help {
+  print <<EOF;
+
+$0: Use this script to show RBLD stats
+
+usage:
+        -c|--config     Path to rbld configuration file to load socket path (default is /etc/rbld.conf)
+        -s|--socket     Alternatively, you can specify the socket path directly
+        -h|--help       Help
+EOF
+  exit;
+}

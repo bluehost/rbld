@@ -1,0 +1,175 @@
+#!/usr/bin/perl
+
+##########################################################################
+# pullrbllists - A script that pulls down lists that can be used with RBLD
+# Copyright 2006, Bluehost, Inc.
+#
+# Authors and Contributers:
+#
+# Spencer Candland  <spencer@bluehost.com>
+# Cade Ekblad-Frank <cade@bluehost.com>
+# Robert Lawrence   <robert@bluehost.com>
+# Jacob Bushman     <jacob@bluehost.com>
+# Ryan Chaudhry     <rchaudhry@bluehost.com>
+# Erick Cantwell    <erick@bluehost.com>
+#
+# http://www.bluehost.com
+# https://github.com/bluehost/rbld
+#
+##########################################################################
+#
+# This file is part of rbld
+#
+# Rbld is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA02111-1307, USA.
+#
+##########################################################################
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Data::Dumper;
+use LWP::Simple;
+use LWP::UserAgent;
+use HTTP::Request::Common qw(GET);
+use Proc::PID::File;
+use File::Basename;
+use File::Copy;
+use YAML::Syck qw(LoadFile);
+
+my $skip_sleep  = 0;
+my $config_file = '/etc/rbld.d/pullrbllists.yml';
+my $list        = {};
+my $settings    = {};
+my $pidpath;
+my $home_dir;
+my $listtype;
+my $list_path;
+
+# Get cli options
+GetOptions (
+    's|skip'        => \$skip_sleep,
+    'c|config=s'    => \$config_file,
+    'l|listpath=s'  => \$list_path,
+    'd|homedir=s'   => \$home_dir,
+    'r|pid=s'       => \$pidpath,
+    't|type=s'      => \$listtype,
+    'h|help'        => \&help,
+) || &help;
+
+# Read the configuration file
+$settings = LoadFile($config_file);
+
+# Merge configuration file with cli options
+# cli options always win
+if ($list_path) {
+    $settings->{list_path} = $list_path;
+}
+
+if ($home_dir) {
+    $settings->{home_dir} = $home_dir;
+}
+
+if ($pidpath) {
+    $settings->{pid} = $pidpath;
+}
+
+# Validate that we have settings that we need
+_validate_settings($settings);
+
+# See if we can continue to run
+my($pidfile, $piddir) = fileparse($settings->{pid});
+exit 1 if Proc::PID::File->running(dir => $piddir, name => $pidfile);
+
+# Delay requests to rbl list server to keep from overwhelming it
+sleep int(rand(120)) unless ($skip_sleep);
+
+# Loop through all of the lists and hopefully download them successfully
+foreach my $ipurl (keys %{$settings->{lists}}) {
+    if ($listtype) {
+        unless ($settings->{lists}{$ipurl}{type} eq $listtype) {
+            next;
+        }
+    }
+
+    my $url        = $settings->{lists}{$ipurl}{url};
+    my $local_file = $settings->{lists}{$ipurl}{local_file};
+    my $savepath   = "$settings->{list_path}/$local_file";
+
+    # See if we need to do basic authentication
+    if ($settings->{lists}{$ipurl}{username}) {
+        my $ua = LWP::UserAgent->new();
+        my $req = GET "$url";
+        $req->authorization_basic("$settings->{lists}{$ipurl}{username}", "$settings->{lists}{$ipurl}{password}");
+        my $response = $ua->request($req);
+        my $rc       = $response->code;
+        if ($rc == 200) {
+            my $body     = $response->content;
+            open(TEMP, '>', "$savepath.temp");
+            print TEMP $body;
+            close(TEMP);
+        } else {
+            next;
+        }
+    } else {
+        my $rc = getstore($url, "$savepath.temp");
+        if ($rc != 200) {
+            print STDERR "Could not download $url: Recieved $rc status\n";
+            next;
+        }
+    }
+    next if -z "$savepath.temp";
+    move("$savepath.temp","$savepath") or ((print STDERR "Could not move file: $!\n") && (next));
+}
+
+# Help me
+sub help {
+  print <<EOF;
+
+$0: Use this script to pull down preconfigured lists that can be used with rbld
+
+usage:
+        -s|--skip       Skip Random Sleep
+        -c|--config     Path to configuration file (default is /etc/rbld.d/pullrbllists.yml)
+        -l|--listpath   Final path to where lists should end up after being downloaded
+        -d|--homedir    ENV HOME to use when looking for .wgetrc
+        -r|--pid        Pidfile
+        -t|--type       Only download lists of certain type
+        -h|--help       Help
+EOF
+  exit;
+}
+
+# Method to handle configuration settings validation
+sub _validate_settings {
+    my $params = shift;
+
+    my @neededVals = qw(list_path home_dir pid);
+    for my $val (@neededVals) {
+        if ($params->{$val}) {
+            chomp($params->{$val});
+            next;
+        } else {
+            print STDERR "$val not present, not safe to proceed\n";
+            exit 1;
+        }
+    }
+
+    # Make sure that we have lists
+    unless ($params->{lists}) {
+        print STDERR "No lists to download, not safe to proceed\n";
+        exit 1;
+    }
+}
